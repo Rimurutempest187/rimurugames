@@ -18,33 +18,26 @@ REQUIRED_PACKAGES = [
 ]
 
 def install_packages():
-"""Installs missing packages via pip automatically."""
-failed = []
-for module_name, pip_name in REQUIRED_PACKAGES:
-try:
-importlib.import_module(module_name)
-except ImportError:
-print(f"📦 Package '{module_name}' not found. Installing '{pip_name}'...")
-try:
-subprocess.check_call([sys.executable, "-m", "pip", "install", pip_name])
-print(f"✅ Installed '{pip_name}'.")
-except subprocess.CalledProcessError as e:
-print(f"❌ Failed to install '{pip_name}': {e}")
-failed.append(pip_name)
-
-```
-if failed:
-    print("CRITICAL: Could not install the following packages manually:")
-    print("  " + " ".join(failed))
-    sys.exit(1)
-
-# Invalidate caches to ensure newly installed packages are found
-importlib.invalidate_caches()
-
-```
-
-install_packages()
-
+    """Installs missing packages via pip automatically."""
+    failed = []
+    for module_name, pip_name in REQUIRED_PACKAGES:
+        try:
+            importlib.import_module(module_name)
+        except ImportError:
+            print(f"📦 Package '{module_name}' not found. Installing '{pip_name}'...")
+            try:
+                subprocess.check_call([sys.executable, "-m", "pip", "install", pip_name])
+                print(f"✅ Installed '{pip_name}'.")
+            except subprocess.CalledProcessError as e:
+                print(f"❌ Failed to install '{pip_name}': {e}")
+                failed.append(pip_name)
+    
+    if failed:
+        print("CRITICAL: Could not install the following packages manually:")
+        print("  " + " ".join(failed))
+        sys.exit(1)
+    
+    importlib.invalidate_caches()
 # --- Imports (Safe after bootstrap) ---
 
 from dotenv import load_dotenv
