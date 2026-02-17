@@ -684,18 +684,3 @@ if __name__ == '__main__':
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         log.info("Bot terminated.")
-```
-
-### Quick notes / how to run
-
-1. Create a `.env` file with at least `BOT_TOKEN` and `OWNER_ID`.
-2. Install requirements: `pip install -r requirements.txt`.
-3. Run `python bot.py`.
-
-This is a practical, ready-to-run starting point. It implements the majority of the commands you asked for in a compact form and is written to be easy to extend. If you want I can next:
-
-* Add `/trade`, `/duel`, `/fusion` mechanics (inventory transfers, confirmation flows)
-* Add better shop inventory and admin-priced items
-* Add file-download & caching to disk for persistent media
-
-Tell me which of those you want next and I'll add them directly.
