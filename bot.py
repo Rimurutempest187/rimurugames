@@ -1,15 +1,9 @@
 #!/usr/bin/env python3
 # coding: utf-8
 """
-Telegram "drop card" game bot (single-file).
-Usage:
-  - Set TELEGRAM_TOKEN environment variable
-  - Optionally set OWNER_ID environment variable (int). Owner has highest privileges.
-  - Run: python bot.py
-Notes:
-  - SQLite DB: cards.db (created automatically)
-  - Media: uses Telegram file_id (no local download)
-  - This is a compact but complete implementation of requested commands.
+Compact Card Drop Bot — single-file runnable.
+Set TELEGRAM_TOKEN env var before running.
+Optional: set OWNER_ID env var (int).
 """
 
 import os
@@ -19,7 +13,7 @@ import aiosqlite
 from datetime import datetime, timedelta
 from typing import Optional
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -36,7 +30,7 @@ if not TOKEN:
 OWNER_ID = int(os.getenv("OWNER_ID") or 0)  # optional
 DB_FILE = os.getenv("DB_FILE") or "cards.db"
 DROP_INTERVAL_SECONDS = 300  # default drop interval; settable via /setdrop
-GROUP_IDS_TO_DROP = []  # If you want automatic drops to specific group ids, fill here (or use broadcast/drop manually)
+GROUP_IDS_TO_DROP = []  # fill with ints or set via settings/drop_chats
 
 # --- Rarity labels (0..9) ---
 RARITY_LABELS = [
@@ -71,7 +65,7 @@ async def init_db():
             name TEXT NOT NULL,
             movie TEXT,
             file_id TEXT NOT NULL,
-            file_type TEXT NOT NULL, -- photo/video
+            file_type TEXT NOT NULL,
             rarity INTEGER DEFAULT 0,
             animated INTEGER DEFAULT 0,
             creator INTEGER,
@@ -164,7 +158,6 @@ async def require_owner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> O
     return None
 
 # --- Core commands ---
-
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = await aiosqlite.connect(DB_FILE)
     await ensure_user(conn, update.effective_user)
@@ -177,8 +170,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Sudo commands*\n"
         "/upload - reply to an image to upload card (caption: name|movie|rarity_index)\n"
         "/uploadvd - reply to a video to upload animated card\n"
-        "/edit <id> <name> <movie> - edit card\n        /delete <id>\n"
-        "/setdrop <seconds> - set automatic drop interval\n        /gban <id/username/reply>\n        /ungban <id/username/reply>\n        /gmute <id/username/reply>\n        /ungmute <id/username/reply>\n\n"
+        "/edit <id> <name> <movie> - edit card\n/delete <id>\n"
+        "/setdrop <seconds> - set automatic drop interval\n/gban <id/username/reply>\n/ungban <id/username/reply>\n/gmute <id/username/reply>\n/ungmute <id/username/reply>\n\n"
         "*User commands*\n"
         "/balance /shop /buy /daily\n"
         "/slots /wheel /basket\n"
@@ -187,14 +180,13 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/fusion /duel /trade (use reply)\n"
         "/marry /divorce (use reply)\n"
         "/set /removeset\n"
-        "/Catch <card_name> (reply to drop message or use name)\n        /top - top collectors\n\n"
+        "/Catch <card_name> (reply to drop message or use name)\n/top - top collectors\n\n"
         "Owner: /addsudo /sudolist /broadcast\n"
     )
     await update.message.reply_markdown(txt)
 
 # --- Upload image (sudo) ---
 async def upload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Expect reply to message containing a photo or document image.
     user = update.effective_user
     conn = await require_sudo(update, context)
     if not conn:
@@ -206,7 +198,6 @@ async def upload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         media = update.message.reply_to_message
         file_id = None
         file_type = None
-        # accept photo
         if media.photo:
             file_id = media.photo[-1].file_id
             file_type = "photo"
@@ -233,7 +224,6 @@ async def upload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except:
                     pass
         if not name:
-            # fallback to asking short name from command args
             if context.args:
                 name = " ".join(context.args)
             else:
@@ -245,13 +235,11 @@ async def upload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             (name, movie, file_id, file_type, rarity, 0, user.id, now)
         )
         await conn.commit()
-        row = await db_get(conn, "SELECT last_insert_rowid()")
         await update.message.reply_text(f"✅ Card uploaded: *{name}* ({rarity_text(rarity)})", parse_mode="Markdown")
     finally:
         await conn.close()
 
 async def uploadvd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # reply to a video message
     user = update.effective_user
     conn = await require_sudo(update, context)
     if not conn:
@@ -340,13 +328,11 @@ async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Sudo: ban/mute ---
 async def _resolve_target_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Accept id, @username or reply
     if update.message.reply_to_message:
         return update.message.reply_to_message.from_user.id
     if context.args:
         t = context.args[0]
         if t.startswith("@"):
-            # cannot resolve username to id reliably without bot.get_chat, so try to fetch user via get_chat
             try:
                 chat = await context.bot.get_chat(t)
                 return chat.id
@@ -410,10 +396,6 @@ async def gmute_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ungmute_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = await require_sudo(update, context)
     if not conn:
-        await update.message.reply_text("Could not resolve target id.")
-        return
-    conn = await require_sudo(update, context)
-    if not conn:
         return
     try:
         tid = await _resolve_target_id(update, context)
@@ -431,26 +413,27 @@ DROP_LOCK = asyncio.Lock()
 
 async def perform_drop(bot, chat_id:int, conn: aiosqlite.Connection):
     async with DROP_LOCK:
-        # pick a random card
         row = await db_get(conn, "SELECT id, name, file_id, file_type, rarity, animated FROM cards ORDER BY RANDOM() LIMIT 1")
         if not row:
             return None
         cid, name, file_id, file_type, rarity, animated = row
         text = f"🎴 *Drop!* A card appeared: *{name}* — {rarity_text(rarity)}\nReply with /Catch or use `/Catch {name}` to catch!"
-        if file_type == "photo":
-            msg = await bot.send_photo(chat_id=chat_id, photo=file_id, caption=text, parse_mode="Markdown")
-        else:
-            msg = await bot.send_video(chat_id=chat_id, video=file_id, caption=text, parse_mode="Markdown")
+        try:
+            if file_type == "photo":
+                msg = await bot.send_photo(chat_id=chat_id, photo=file_id, caption=text, parse_mode="Markdown")
+            else:
+                msg = await bot.send_video(chat_id=chat_id, video=file_id, caption=text, parse_mode="Markdown")
+        except Exception:
+            # fallback to text-only drop if sending media fails
+            msg = await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
         await conn.execute(
             "INSERT INTO drops(card_id, chat_id, message_id, dropped_at) VALUES (?,?,?,?)",
-            (cid, chat_id, msg.message_id, datetime.utcnow().isoformat())
+            (cid, chat_id, getattr(msg, "message_id", msg.message_id), datetime.utcnow().isoformat())
         )
         await conn.commit()
         return (cid, msg.message_id)
 
-# background drop loop
 async def drop_loop(app):
-    # Use settings table for interval
     while True:
         try:
             async with aiosqlite.connect(DB_FILE) as conn:
@@ -462,9 +445,7 @@ async def drop_loop(app):
                         interval = DROP_INTERVAL_SECONDS
                 else:
                     interval = DROP_INTERVAL_SECONDS
-                # decide where to drop: if specific group ids configured, use them; else skip
                 targets = GROUP_IDS_TO_DROP.copy()
-                # also use chats stored in settings under 'drop_chats' as comma-separated
                 row2 = await db_get(conn, "SELECT value FROM settings WHERE key = ?", ("drop_chats",))
                 if row2 and row2[0]:
                     try:
@@ -477,7 +458,6 @@ async def drop_loop(app):
                 if targets:
                     for chat_id in targets:
                         await perform_drop(app.bot, chat_id, conn)
-                # sleep interval
             await asyncio.sleep(interval)
         except asyncio.CancelledError:
             break
@@ -505,20 +485,17 @@ async def setdrop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 CATCH_LOCK = asyncio.Lock()
 
 async def catch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # user attempts to catch either by replying to drop or by /Catch <name>
     user = update.effective_user
     conn = await aiosqlite.connect(DB_FILE)
     try:
         await ensure_user(conn, user)
         target_drop = None
-        # if reply to a message that is a drop, find it
         if update.message.reply_to_message:
             rid = update.message.reply_to_message.message_id
             row = await db_get(conn, "SELECT id, card_id, caught_by FROM drops WHERE chat_id=? AND message_id=? ORDER BY id DESC LIMIT 1", (update.effective_chat.id, rid))
             if row:
                 target_drop = row
         if not target_drop:
-            # find most recent uncaught drop in this chat with that name
             name = " ".join(context.args) if context.args else None
             if name:
                 row = await db_get(conn,
@@ -527,7 +504,6 @@ async def catch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if row:
                     target_drop = row
             else:
-                # take last uncaught drop
                 row = await db_get(conn, "SELECT id, card_id, caught_by FROM drops WHERE chat_id=? AND caught_by=0 ORDER BY dropped_at DESC LIMIT 1", (update.effective_chat.id,))
                 if row:
                     target_drop = row
@@ -535,25 +511,20 @@ async def catch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("No available drop to catch here.")
             return
         drop_id, card_id, caught_by = target_drop
-        # atomic claim
         async with CATCH_LOCK:
             row2 = await db_get(conn, "SELECT caught_by FROM drops WHERE id=?", (drop_id,))
             if row2 and row2[0] and row2[0] != 0:
                 await update.message.reply_text("Too late — someone already caught it.")
                 return
-            # chance formula: higher rarity harder. We'll allow immediate catch first come first served with small randomness.
             card = await db_get(conn, "SELECT name, rarity FROM cards WHERE id=?", (card_id,))
             if not card:
                 await update.message.reply_text("Card not found.")
                 return
             name, rarity = card
-            # small probability fail: e.g., success chance = max(0.2, 1 - rarity*0.08)
             success_chance = max(0.2, 1.0 - rarity * 0.075)
             if random.random() <= success_chance:
-                # success
                 await conn.execute("UPDATE drops SET caught_by=? WHERE id=?", (user.id, drop_id))
                 await conn.commit()
-                # reward: give some coins depending on rarity
                 reward = 10 + (9 - rarity) * 5 + rarity * 10
                 await change_balance(conn, user.id, reward, note=f"caught card {name}")
                 await update.message.reply_text(f"🎉 You caught *{name}*! Reward: {reward} coins.", parse_mode="Markdown")
@@ -581,10 +552,9 @@ async def daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         last_daily = row[0] if row else None
         if last_daily:
             dt = datetime.fromisoformat(last_daily)
-            if datetime.utcnow() - dt < timedelta(hours=20):  # 20h cooldown
+            if datetime.utcnow() - dt < timedelta(hours=20):
                 await update.message.reply_text("Daily already claimed. Try later.")
                 return
-        # reward
         reward = random.randint(50, 150)
         await conn.execute("UPDATE users SET balance=balance+?, last_daily=? WHERE id=?", (reward, datetime.utcnow().isoformat(), update.effective_user.id))
         await conn.commit()
@@ -606,12 +576,10 @@ async def slots_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if bet <= 0 or bet > bal:
             await update.message.reply_text("Invalid bet.")
             return
-        # simple slot: 3 reels of symbols 0..4
         reels = [random.randint(0,4) for _ in range(3)]
         symbols = ["🍒","🍋","🔔","⭐","💎"]
         display = " ".join(symbols[r] for r in reels)
         if reels[0] == reels[1] == reels[2]:
-            # big win: 5x
             win = bet * 5
             await change_balance(conn, update.effective_user.id, win, note="slots win")
             result = f"JACKPOT! {display}\nYou won {win} coins!"
@@ -620,7 +588,6 @@ async def slots_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await change_balance(conn, update.effective_user.id, win, note="slots small win")
             result = f"{display}\nYou won {win} coins!"
         else:
-            # lose
             await change_balance(conn, update.effective_user.id, -bet, note="slots lose")
             result = f"{display}\nYou lost {bet} coins."
         await update.message.reply_text(result)
@@ -640,7 +607,6 @@ async def wheel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if bet <= 0 or bet > bal:
             await update.message.reply_text("Invalid bet.")
             return
-        # wheel with multipliers
         multipliers = [0, 0.5, 1, 2, 5, 10]
         mult = random.choice(multipliers)
         if mult == 0:
@@ -663,7 +629,6 @@ async def duel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if target.is_bot:
         await update.message.reply_text("Cannot duel bots.")
         return
-    # simple duel: random winner
     winner = random.choice([challenger, target])
     await update.message.reply_text(f"⚔️ Duel result: {winner.full_name} wins!")
 
@@ -698,7 +663,6 @@ async def divorce_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Owner / sudo management ---
 async def addsudo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Owner only
     conn = await require_owner(update, context)
     if not conn:
         return
@@ -706,13 +670,17 @@ async def addsudo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.message.reply_to_message:
             tid = update.message.reply_to_message.from_user.id
         elif context.args:
-            tid = int(context.args[0])
+            try:
+                tid = int(context.args[0])
+            except:
+                await update.message.reply_text("Invalid id.")
+                return
         else:
             await update.message.reply_text("Usage: /addsudo <id> or reply.")
             return
         await conn.execute("INSERT OR REPLACE INTO sudo_users(id) VALUES (?)", (tid,))
         await conn.commit()
-        await update.message.reply_text(f"✅ Added sudo user: {tid}")
+        await update.message.reply_text(f"✅ Added sudo: {tid}")
     finally:
         await conn.close()
 
@@ -725,8 +693,8 @@ async def sudolist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not rows:
             await update.message.reply_text("No sudo users.")
             return
-        lst = "\n".join(str(r[0]) for r in rows)
-        await update.message.reply_text(f"Sudo users:\n{lst}")
+        txt = "Sudo users:\n" + "\n".join(str(r[0]) for r in rows)
+        await update.message.reply_text(txt)
     finally:
         await conn.close()
 
@@ -735,111 +703,70 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not conn:
         return
     try:
-        if not context.args and not update.message.reply_to_message:
-            await update.message.reply_text("Usage: /broadcast <text> or reply to a message to broadcast.")
+        if not context.args:
+            await update.message.reply_text("Usage: /broadcast <message>")
             return
-        text = " ".join(context.args) if context.args else update.message.reply_to_message.text or ""
-        # For demo: broadcast to group IDs kept in settings->drop_chats
-        row = await db_get(conn, "SELECT value FROM settings WHERE key=?", ("drop_chats",))
-        if not row or not row[0]:
-            await update.message.reply_text("No drop_chats configured in settings (no targets). Use /setdropchats or set settings directly.")
-            return
-        targets = [int(x) for x in row[0].split(",") if x.strip()]
-        sent = 0
-        for chat_id in targets:
-            try:
-                await context.bot.send_message(chat_id=chat_id, text=text)
-                sent += 1
-            except Exception as e:
-                print("broadcast to",chat_id,"failed:",e)
-        await update.message.reply_text(f"Broadcast sent to {sent} chats.")
-    finally:
-        await conn.close()
-
-# --- Misc utilities: top collectors ---
-async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = await aiosqlite.connect(DB_FILE)
-    try:
-        rows = await db_all(conn, """
-            SELECT u.id, u.username, COUNT(c.id) as cnt
-            FROM users u
-            LEFT JOIN drops d ON d.caught_by = u.id
-            LEFT JOIN cards c ON c.id = d.card_id
-            GROUP BY u.id
-            ORDER BY cnt DESC
-            LIMIT 10
-        """)
-        txt = "🏆 Top collectors:\n"
+        msg = " ".join(context.args)
+        rows = await db_all(conn, "SELECT id FROM users")
+        count = 0
         for r in rows:
-            uid, uname, cnt = r
-            txt += f"{uname or uid}: {cnt}\n"
-        await update.message.reply_text(txt)
+            uid = r[0]
+            try:
+                await context.bot.send_message(chat_id=uid, text=msg)
+                count += 1
+            except Exception:
+                pass
+        await update.message.reply_text(f"Broadcast sent to {count} users.")
     finally:
         await conn.close()
 
-# --- Startup / main ---
-async def on_startup(app):
-    await init_db()
-    # create owner as sudo if OWNER_ID set
-    if OWNER_ID:
-        async with aiosqlite.connect(DB_FILE) as conn:
-            await conn.execute("INSERT OR REPLACE INTO sudo_users(id) VALUES (?)", (OWNER_ID,))
-            await conn.commit()
-    # start drop loop background task
-    app.job_drop_loop = app.create_task(drop_loop(app))
-    print("Bot started and DB initialized.")
+# --- Misc handlers / fallback ---
+async def unknown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Unknown command. Use /help to see available commands.")
 
-async def on_shutdown(app):
-    # cancel drop task
-    task = getattr(app, "job_drop_loop", None)
-    if task:
-        task.cancel()
-        try:
-            await task
-        except:
-            pass
-    print("Shutting down...")
-
+# --- Main entrypoint ---
 def main():
-    app = ApplicationBuilder().token(TOKEN).concurrent_updates(True).build()
+    # initialize DB and start bot
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(init_db())
 
-    # Basic commands
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    # Register handlers
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("upload", upload_cmd))
     app.add_handler(CommandHandler("uploadvd", uploadvd_cmd))
     app.add_handler(CommandHandler("edit", edit_cmd))
     app.add_handler(CommandHandler("delete", delete_cmd))
-    app.add_handler(CommandHandler("setdrop", setdrop_cmd))
     app.add_handler(CommandHandler("gban", gban_cmd))
     app.add_handler(CommandHandler("ungban", ungban_cmd))
     app.add_handler(CommandHandler("gmute", gmute_cmd))
     app.add_handler(CommandHandler("ungmute", ungmute_cmd))
-
-    # user economy/games
+    app.add_handler(CommandHandler("setdrop", setdrop_cmd))
+    app.add_handler(CommandHandler("Catch", catch_cmd))
     app.add_handler(CommandHandler("balance", balance_cmd))
     app.add_handler(CommandHandler("daily", daily_cmd))
     app.add_handler(CommandHandler("slots", slots_cmd))
     app.add_handler(CommandHandler("wheel", wheel_cmd))
-    app.add_handler(CommandHandler("Catch", catch_cmd))
-    app.add_handler(CommandHandler("catch", catch_cmd))  # lowercase alias
-
-    # social/trade
     app.add_handler(CommandHandler("duel", duel_cmd))
     app.add_handler(CommandHandler("trade", trade_cmd))
     app.add_handler(CommandHandler("marry", marry_cmd))
     app.add_handler(CommandHandler("divorce", divorce_cmd))
-
-    # owner / sudo
     app.add_handler(CommandHandler("addsudo", addsudo_cmd))
     app.add_handler(CommandHandler("sudolist", sudolist_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
-    app.add_handler(CommandHandler("top", top_cmd))
+    app.add_handler(CommandHandler("setdrop", setdrop_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("unknown", unknown_cmd))
+    app.add_handler(MessageHandler(filters.COMMAND, unknown_cmd))
 
-    app.post_init = on_startup
-    app.pre_shutdown = on_shutdown
+    # Start background drop loop task
+    # create_task is safe here; run_polling will run the loop
+    loop.create_task(drop_loop(app))
 
-    print("Running bot...")
+    print("Bot starting...")
     app.run_polling()
 
 if __name__ == "__main__":
