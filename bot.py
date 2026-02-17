@@ -1,773 +1,337 @@
 #!/usr/bin/env python3
 # coding: utf-8
 """
-Compact Card Drop Bot — single-file runnable.
+Minimal Telegram bot using only Python stdlib.
+Features:
+ - Uses getUpdates long-polling (no external libs)
+ - SQLite (stdlib) for persistence
+ - Background text-only drops
+ - Commands: /start /help /balance /daily /slots /Catch /setdrop (owner)
 Set TELEGRAM_TOKEN env var before running.
 Optional: set OWNER_ID env var (int).
 """
 
 import os
-import asyncio
+import sys
+import time
+import json
 import random
-import aiosqlite
+import sqlite3
+import threading
 from datetime import datetime, timedelta
-from typing import Optional
+from urllib import request, parse, error
 
-from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
-
-# --- Config (env) ---
+# --- Config ---
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 if not TOKEN:
-    raise RuntimeError("Please set TELEGRAM_TOKEN env variable.")
+    print("Please set TELEGRAM_TOKEN environment variable.")
+    sys.exit(1)
 
-OWNER_ID = int(os.getenv("OWNER_ID") or 0)  # optional
-DB_FILE = os.getenv("DB_FILE") or "cards.db"
-DROP_INTERVAL_SECONDS = 300  # default drop interval; settable via /setdrop
-GROUP_IDS_TO_DROP = []  # fill with ints or set via settings/drop_chats
+OWNER_ID = int(os.getenv("OWNER_ID") or 0)
+DB_FILE = os.getenv("DB_FILE") or "cards_min.db"
+DROP_INTERVAL_SECONDS = int(os.getenv("DROP_INTERVAL_SECONDS") or 300)
 
-# --- Rarity labels (0..9) ---
-RARITY_LABELS = [
-    "Common", "Uncommon", "Rare", "Epic", "Legendary",
-    "Mythic", "Divine", "Celestial", "Supreme", "Animated"
-]
-RARITY_EMOJIS = ["⚪","🟢","🔵","🟣","🟠","🔴","🟡","💎","👑","✨"]
+API_URL = f"https://api.telegram.org/bot{TOKEN}/"
 
-# --- DB helpers ---
-async def init_db():
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.executescript("""
-        PRAGMA foreign_keys = ON;
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY,
-            username TEXT,
-            balance INTEGER DEFAULT 0,
-            last_daily TEXT
-        );
-        CREATE TABLE IF NOT EXISTS sudo_users (
-            id INTEGER PRIMARY KEY
-        );
-        CREATE TABLE IF NOT EXISTS bans (
-            id INTEGER PRIMARY KEY,
-            reason TEXT
-        );
-        CREATE TABLE IF NOT EXISTS mutes (
-            id INTEGER PRIMARY KEY
-        );
-        CREATE TABLE IF NOT EXISTS cards (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            movie TEXT,
-            file_id TEXT NOT NULL,
-            file_type TEXT NOT NULL,
-            rarity INTEGER DEFAULT 0,
-            animated INTEGER DEFAULT 0,
-            creator INTEGER,
-            created_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS drops (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            card_id INTEGER,
-            chat_id INTEGER,
-            message_id INTEGER,
-            dropped_at TEXT,
-            caught_by INTEGER DEFAULT 0,
-            FOREIGN KEY(card_id) REFERENCES cards(id)
-        );
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        );
-        CREATE TABLE IF NOT EXISTS transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            amount INTEGER,
-            note TEXT,
-            at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS marriages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user1 INTEGER,
-            user2 INTEGER,
-            at TEXT
-        );
-        """)
-        await db.commit()
+# --- HTTP helpers (stdlib) ---
+def api_call(method, params=None, files=None):
+    url = API_URL + method
+    if files:
+        # not used in this minimal version
+        raise NotImplementedError("File upload not implemented in stdlib version.")
+    data = None
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    if params:
+        data = parse.urlencode(params).encode()
+    req = request.Request(url, data=data, headers=headers)
+    try:
+        with request.urlopen(req, timeout=30) as resp:
+            return json.load(resp)
+    except error.HTTPError as e:
+        try:
+            return json.load(e)
+        except Exception:
+            return {"ok": False, "error": str(e)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
-async def db_get(conn, query, params=()):
-    cur = await conn.execute(query, params)
-    row = await cur.fetchone()
-    await cur.close()
-    return row
+def send_message(chat_id, text, parse_mode=None):
+    params = {"chat_id": chat_id, "text": text}
+    if parse_mode:
+        params["parse_mode"] = parse_mode
+    return api_call("sendMessage", params)
 
-async def db_all(conn, query, params=()):
-    cur = await conn.execute(query, params)
-    rows = await cur.fetchall()
-    await cur.close()
-    return rows
-
-# --- Utilities ---
-def is_owner(user_id:int) -> bool:
-    return (OWNER_ID and user_id == OWNER_ID)
-
-async def is_sudo(conn, user_id:int) -> bool:
-    if is_owner(user_id): return True
-    row = await db_get(conn, "SELECT 1 FROM sudo_users WHERE id = ?", (user_id,))
-    return bool(row)
-
-def rarity_text(r:int) -> str:
-    if 0 <= r < len(RARITY_LABELS):
-        return f"{RARITY_EMOJIS[r]} {RARITY_LABELS[r]}"
-    return f"{r}"
-
-async def ensure_user(conn, user):
-    if user is None: return
-    uid = user.id
-    row = await db_get(conn, "SELECT id FROM users WHERE id = ?", (uid,))
-    if not row:
-        await conn.execute("INSERT INTO users(id, username, balance) VALUES (?,?,?)", (uid, user.username or "", 100))
-        await conn.commit()
-
-async def change_balance(conn, user_id:int, amount:int, note:str=""):
-    await conn.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (amount, user_id))
-    await conn.execute("INSERT INTO transactions(user_id, amount, note, at) VALUES (?,?,?,?)", (user_id, amount, note, datetime.utcnow().isoformat()))
-    await conn.commit()
-
-# --- Command decorators / checks ---
-async def require_sudo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[aiosqlite.Connection]:
-    user = update.effective_user
-    conn = await aiosqlite.connect(DB_FILE)
-    if not await is_sudo(conn, user.id):
-        await conn.close()
-        await update.message.reply_text("⛔ You are not authorized to run this command (sudo only).")
-        return None
+# --- DB init ---
+def init_db():
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    cur = conn.cursor()
+    cur.executescript("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY,
+        username TEXT,
+        balance INTEGER DEFAULT 0,
+        last_daily TEXT
+    );
+    CREATE TABLE IF NOT EXISTS drops (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        chat_id INTEGER,
+        dropped_at TEXT,
+        caught_by INTEGER DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    );
+    """)
+    conn.commit()
     return conn
 
-async def require_owner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[aiosqlite.Connection]:
-    user = update.effective_user
-    if is_owner(user.id):
-        conn = await aiosqlite.connect(DB_FILE)
-        return conn
-    await update.message.reply_text("⛔ Owner-only command.")
-    return None
+DB = init_db()
+DB_LOCK = threading.Lock()
 
-# --- Core commands ---
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = await aiosqlite.connect(DB_FILE)
-    await ensure_user(conn, update.effective_user)
-    await conn.close()
-    await update.message.reply_text("Welcome to CardDrop Bot! Use /help to see commands.")
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = (
-        "🃏 *Card Drop Bot commands*\n\n"
-        "*Sudo commands*\n"
-        "/upload - reply to an image to upload card (caption: name|movie|rarity_index)\n"
-        "/uploadvd - reply to a video to upload animated card\n"
-        "/edit <id> <name> <movie> - edit card\n/delete <id>\n"
-        "/setdrop <seconds> - set automatic drop interval\n/gban <id/username/reply>\n/ungban <id/username/reply>\n/gmute <id/username/reply>\n/ungmute <id/username/reply>\n\n"
-        "*User commands*\n"
-        "/balance /shop /buy /daily\n"
-        "/slots /wheel /basket\n"
-        "/givecoin /deposit /topcoin\n"
-        "/missions /titles\n"
-        "/fusion /duel /trade (use reply)\n"
-        "/marry /divorce (use reply)\n"
-        "/set /removeset\n"
-        "/Catch <card_name> (reply to drop message or use name)\n/top - top collectors\n\n"
-        "Owner: /addsudo /sudolist /broadcast\n"
-    )
-    await update.message.reply_markdown(txt)
-
-# --- Upload image (sudo) ---
-async def upload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    conn = await require_sudo(update, context)
-    if not conn:
+# --- Utilities ---
+def ensure_user_row(user):
+    if not user:
         return
-    try:
-        if not update.message.reply_to_message:
-            await update.message.reply_text("Reply to an image (photo/document) with /upload. Optionally include caption: name|movie|rarity_index")
-            return
-        media = update.message.reply_to_message
-        file_id = None
-        file_type = None
-        if media.photo:
-            file_id = media.photo[-1].file_id
-            file_type = "photo"
-        elif media.document and media.document.mime_type and media.document.mime_type.startswith("image"):
-            file_id = media.document.file_id
-            file_type = "photo"
-        else:
-            await update.message.reply_text("Reply to a photo or image document.")
-            return
-        caption = update.message.text.strip() if update.message.text else (media.caption or "")
-        name = None
-        movie = ""
-        rarity = 0
-        if caption:
-            parts = [p.strip() for p in caption.replace("/upload","").split("|") if p.strip()]
-            if len(parts) >= 1:
-                name = parts[0]
-            if len(parts) >= 2:
-                movie = parts[1]
-            if len(parts) >= 3:
-                try:
-                    rr = int(parts[2])
-                    if 0 <= rr <= 9: rarity = rr
-                except:
-                    pass
-        if not name:
-            if context.args:
-                name = " ".join(context.args)
-            else:
-                await update.message.reply_text("Please provide a name. Use caption or /upload <name> as text when replying.")
-                return
-        now = datetime.utcnow().isoformat()
-        await conn.execute(
-            "INSERT INTO cards(name, movie, file_id, file_type, rarity, animated, creator, created_at) VALUES (?,?,?,?,?,?,?,?)",
-            (name, movie, file_id, file_type, rarity, 0, user.id, now)
-        )
-        await conn.commit()
-        await update.message.reply_text(f"✅ Card uploaded: *{name}* ({rarity_text(rarity)})", parse_mode="Markdown")
-    finally:
-        await conn.close()
+    uid = user.get("id")
+    with DB_LOCK:
+        cur = DB.cursor()
+        cur.execute("SELECT id FROM users WHERE id=?", (uid,))
+        if not cur.fetchone():
+            cur.execute("INSERT INTO users(id, username, balance, last_daily) VALUES (?,?,?,?)",
+                        (uid, user.get("username") or "", 100, None))
+            DB.commit()
 
-async def uploadvd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    conn = await require_sudo(update, context)
-    if not conn:
-        return
-    try:
-        if not update.message.reply_to_message:
-            await update.message.reply_text("Reply to a video with /uploadvd. Optionally include caption: name|movie|rarity_index (rarity optional).")
-            return
-        media = update.message.reply_to_message
-        file_id = None
-        file_type = None
-        if media.video:
-            file_id = media.video.file_id
-            file_type = "video"
-        elif media.document and media.document.mime_type and media.document.mime_type.startswith("video"):
-            file_id = media.document.file_id
-            file_type = "video"
-        else:
-            await update.message.reply_text("Reply to a video or video document.")
-            return
-        caption = update.message.text.strip() if update.message.text else (media.caption or "")
-        name = None
-        movie = ""
-        rarity = 9  # Animated slot by default
-        if caption:
-            parts = [p.strip() for p in caption.replace("/uploadvd","").split("|") if p.strip()]
-            if len(parts) >= 1:
-                name = parts[0]
-            if len(parts) >= 2:
-                movie = parts[1]
-            if len(parts) >= 3:
-                try:
-                    rr = int(parts[2])
-                    if 0 <= rr <= 9: rarity = rr
-                except:
-                    pass
-        if not name:
-            if context.args:
-                name = " ".join(context.args)
-            else:
-                await update.message.reply_text("Please provide a name. Use caption or /uploadvd <name> as text when replying.")
-                return
-        now = datetime.utcnow().isoformat()
-        await conn.execute(
-            "INSERT INTO cards(name, movie, file_id, file_type, rarity, animated, creator, created_at) VALUES (?,?,?,?,?,?,?,?)",
-            (name, movie, file_id, file_type, rarity, 1, user.id, now)
-        )
-        await conn.commit()
-        await update.message.reply_text(f"✅ Video Card uploaded: *{name}* ({rarity_text(rarity)})", parse_mode="Markdown")
-    finally:
-        await conn.close()
+def change_balance(user_id, amount):
+    with DB_LOCK:
+        cur = DB.cursor()
+        cur.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (amount, user_id))
+        DB.commit()
 
-# --- Edit/Delete ---
-async def edit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = await require_sudo(update, context)
-    if not conn:
-        return
-    try:
-        args = context.args
-        if len(args) < 3:
-            await update.message.reply_text("Usage: /edit <id> <name> <movie>")
-            return
-        cid = int(args[0])
-        name = args[1]
-        movie = " ".join(args[2:])
-        await conn.execute("UPDATE cards SET name=?, movie=? WHERE id=?", (name, movie, cid))
-        await conn.commit()
-        await update.message.reply_text(f"✅ Card {cid} updated.")
-    finally:
-        await conn.close()
+def get_balance(user_id):
+    with DB_LOCK:
+        cur = DB.cursor()
+        cur.execute("SELECT balance FROM users WHERE id=?", (user_id,))
+        row = cur.fetchone()
+        return row[0] if row else 0
 
-async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = await require_sudo(update, context)
-    if not conn:
-        return
-    try:
-        if not context.args:
-            await update.message.reply_text("Usage: /delete <id>")
-            return
-        cid = int(context.args[0])
-        await conn.execute("DELETE FROM cards WHERE id=?", (cid,))
-        await conn.commit()
-        await update.message.reply_text(f"✅ Card {cid} deleted.")
-    finally:
-        await conn.close()
+def set_setting(key, value):
+    with DB_LOCK:
+        cur = DB.cursor()
+        cur.execute("INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)", (key, str(value)))
+        DB.commit()
 
-# --- Sudo: ban/mute ---
-async def _resolve_target_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.reply_to_message:
-        return update.message.reply_to_message.from_user.id
-    if context.args:
-        t = context.args[0]
-        if t.startswith("@"):
-            try:
-                chat = await context.bot.get_chat(t)
-                return chat.id
-            except:
-                try:
-                    return int(t.strip("@"))
-                except:
-                    return None
-        else:
-            try:
-                return int(t)
-            except:
-                return None
-    return None
+def get_setting(key):
+    with DB_LOCK:
+        cur = DB.cursor()
+        cur.execute("SELECT value FROM settings WHERE key=?", (key,))
+        row = cur.fetchone()
+        return row[0] if row else None
 
-async def gban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = await require_sudo(update, context)
-    if not conn:
-        return
-    try:
-        tid = await _resolve_target_id(update, context)
-        if not tid:
-            await update.message.reply_text("Could not resolve target id. Use reply or id or @username.")
-            return
-        await conn.execute("INSERT OR REPLACE INTO bans(id, reason) VALUES (?,?)", (tid, "gban"))
-        await conn.commit()
-        await update.message.reply_text(f"⛔ Globally banned: {tid}")
-    finally:
-        await conn.close()
+# --- Drops (text-only) ---
+def perform_drop(chat_id):
+    # choose a random name from a small pool
+    pool = ["Red Dragon","Blue Phoenix","Silver Knight","Golden Fox","Shadow Wolf"]
+    name = random.choice(pool)
+    now = datetime.utcnow().isoformat()
+    with DB_LOCK:
+        cur = DB.cursor()
+        cur.execute("INSERT INTO drops(name, chat_id, dropped_at) VALUES (?,?,?)", (name, chat_id, now))
+        DB.commit()
+    text = f"🎴 Drop! A card appeared: *{name}*\nReply with /Catch or use `/Catch {name}` to catch!"
+    send_message(chat_id, text, parse_mode="Markdown")
 
-async def ungban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = await require_sudo(update, context)
-    if not conn:
-        return
-    try:
-        tid = await _resolve_target_id(update, context)
-        if not tid:
-            await update.message.reply_text("Could not resolve target id.")
-            return
-        await conn.execute("DELETE FROM bans WHERE id=?", (tid,))
-        await conn.commit()
-        await update.message.reply_text(f"✅ Ungbanned: {tid}")
-    finally:
-        await conn.close()
-
-async def gmute_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = await require_sudo(update, context)
-    if not conn:
-        return
-    try:
-        tid = await _resolve_target_id(update, context)
-        if not tid:
-            await update.message.reply_text("Could not resolve target id.")
-            return
-        await conn.execute("INSERT OR REPLACE INTO mutes(id) VALUES (?)", (tid,))
-        await conn.commit()
-        await update.message.reply_text(f"🔇 Globally muted: {tid}")
-    finally:
-        await conn.close()
-
-async def ungmute_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = await require_sudo(update, context)
-    if not conn:
-        return
-    try:
-        tid = await _resolve_target_id(update, context)
-        if not tid:
-            await update.message.reply_text("Could not resolve target id.")
-            return
-        await conn.execute("DELETE FROM mutes WHERE id=?", (tid,))
-        await conn.commit()
-        await update.message.reply_text(f"✅ Unmuted: {tid}")
-    finally:
-        await conn.close()
-
-# --- Drop system ---
-DROP_LOCK = asyncio.Lock()
-
-async def perform_drop(bot, chat_id:int, conn: aiosqlite.Connection):
-    async with DROP_LOCK:
-        row = await db_get(conn, "SELECT id, name, file_id, file_type, rarity, animated FROM cards ORDER BY RANDOM() LIMIT 1")
-        if not row:
-            return None
-        cid, name, file_id, file_type, rarity, animated = row
-        text = f"🎴 *Drop!* A card appeared: *{name}* — {rarity_text(rarity)}\nReply with /Catch or use `/Catch {name}` to catch!"
-        try:
-            if file_type == "photo":
-                msg = await bot.send_photo(chat_id=chat_id, photo=file_id, caption=text, parse_mode="Markdown")
-            else:
-                msg = await bot.send_video(chat_id=chat_id, video=file_id, caption=text, parse_mode="Markdown")
-        except Exception:
-            # fallback to text-only drop if sending media fails
-            msg = await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
-        await conn.execute(
-            "INSERT INTO drops(card_id, chat_id, message_id, dropped_at) VALUES (?,?,?,?)",
-            (cid, chat_id, getattr(msg, "message_id", msg.message_id), datetime.utcnow().isoformat())
-        )
-        await conn.commit()
-        return (cid, msg.message_id)
-
-async def drop_loop(app):
+def drop_loop():
     while True:
         try:
-            async with aiosqlite.connect(DB_FILE) as conn:
-                row = await db_get(conn, "SELECT value FROM settings WHERE key = ?", ("drop_interval",))
-                if row:
-                    try:
-                        interval = int(row[0])
-                    except:
-                        interval = DROP_INTERVAL_SECONDS
-                else:
-                    interval = DROP_INTERVAL_SECONDS
-                targets = GROUP_IDS_TO_DROP.copy()
-                row2 = await db_get(conn, "SELECT value FROM settings WHERE key = ?", ("drop_chats",))
-                if row2 and row2[0]:
-                    try:
-                        extra = [int(x) for x in row2[0].split(",") if x.strip()]
-                        for e in extra:
-                            if e not in targets:
-                                targets.append(e)
-                    except:
-                        pass
-                if targets:
-                    for chat_id in targets:
-                        await perform_drop(app.bot, chat_id, conn)
-            await asyncio.sleep(interval)
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            print("Drop loop error:", e)
-            await asyncio.sleep(10)
+            interval = int(get_setting("drop_interval") or DROP_INTERVAL_SECONDS)
+        except Exception:
+            interval = DROP_INTERVAL_SECONDS
+        # target chats: read from settings 'drop_chats' as comma-separated ids
+        raw = get_setting("drop_chats")
+        targets = []
+        if raw:
+            try:
+                targets = [int(x) for x in raw.split(",") if x.strip()]
+            except:
+                targets = []
+        # if no targets, skip
+        if targets:
+            for cid in targets:
+                try:
+                    perform_drop(cid)
+                except Exception as e:
+                    print("perform_drop error:", e)
+        time.sleep(interval)
 
-# /setdrop
-async def setdrop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = await require_sudo(update, context)
-    if not conn:
+# --- Update processing (long-polling) ---
+OFFSET = None
+
+def handle_update(u):
+    global OFFSET
+    OFFSET = max(OFFSET or 0, u["update_id"] + 1)
+    msg = u.get("message") or u.get("edited_message")
+    if not msg:
         return
-    try:
-        if not context.args:
-            await update.message.reply_text("Usage: /setdrop <seconds>")
+    chat = msg.get("chat", {})
+    chat_id = chat.get("id")
+    user = msg.get("from")
+    text = msg.get("text") or ""
+    ensure_user_row(user)
+
+    # simple command parsing
+    parts = text.strip().split()
+    if not parts:
+        return
+    cmd = parts[0].lstrip("/").split("@")[0]
+    args = parts[1:]
+
+    # Owner check
+    is_owner = (OWNER_ID and user and user.get("id") == OWNER_ID)
+
+    if cmd.lower() == "start":
+        send_message(chat_id, "Welcome to Minimal CardDrop Bot! Use /help to see commands.")
+    elif cmd.lower() == "help":
+        send_message(chat_id,
+            "/start /help\n/balance - show coins\n/daily - claim daily\n/slots <bet> - play slots\n/Catch [name] - catch last drop or by name\n\nOwner: /setdrop <seconds> ; /adddropchat <chat_id>")
+    elif cmd.lower() == "balance":
+        bal = get_balance(user.get("id"))
+        send_message(chat_id, f"💰 Balance: {bal} coins")
+    elif cmd.lower() == "daily":
+        with DB_LOCK:
+            cur = DB.cursor()
+            cur.execute("SELECT last_daily FROM users WHERE id=?", (user.get("id"),))
+            row = cur.fetchone()
+            last = row[0] if row else None
+            if last:
+                try:
+                    dt = datetime.fromisoformat(last)
+                    if datetime.utcnow() - dt < timedelta(hours=20):
+                        send_message(chat_id, "Daily already claimed. Try later.")
+                        return
+                except:
+                    pass
+            reward = random.randint(50, 150)
+            cur.execute("UPDATE users SET balance=balance+?, last_daily=? WHERE id=?", (reward, datetime.utcnow().isoformat(), user.get("id")))
+            DB.commit()
+        send_message(chat_id, f"✅ Daily claimed: {reward} coins")
+    elif cmd.lower() == "slots":
+        if not args:
+            send_message(chat_id, "Usage: /slots <bet>")
             return
-        sec = int(context.args[0])
-        await conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)", ("drop_interval", str(sec)))
-        await conn.commit()
-        await update.message.reply_text(f"✅ Drop interval set to {sec} seconds.")
-    finally:
-        await conn.close()
-
-# --- Catch command ---
-CATCH_LOCK = asyncio.Lock()
-
-async def catch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    conn = await aiosqlite.connect(DB_FILE)
-    try:
-        await ensure_user(conn, user)
-        target_drop = None
-        if update.message.reply_to_message:
-            rid = update.message.reply_to_message.message_id
-            row = await db_get(conn, "SELECT id, card_id, caught_by FROM drops WHERE chat_id=? AND message_id=? ORDER BY id DESC LIMIT 1", (update.effective_chat.id, rid))
-            if row:
-                target_drop = row
-        if not target_drop:
-            name = " ".join(context.args) if context.args else None
-            if name:
-                row = await db_get(conn,
-                    "SELECT d.id, d.card_id, d.caught_by FROM drops d JOIN cards c ON c.id=d.card_id WHERE d.chat_id=? AND d.caught_by=0 AND lower(c.name)=? ORDER BY d.dropped_at DESC LIMIT 1",
-                    (update.effective_chat.id, name.lower()))
-                if row:
-                    target_drop = row
-            else:
-                row = await db_get(conn, "SELECT id, card_id, caught_by FROM drops WHERE chat_id=? AND caught_by=0 ORDER BY dropped_at DESC LIMIT 1", (update.effective_chat.id,))
-                if row:
-                    target_drop = row
-        if not target_drop:
-            await update.message.reply_text("No available drop to catch here.")
+        try:
+            bet = int(args[0])
+        except:
+            send_message(chat_id, "Invalid bet.")
             return
-        drop_id, card_id, caught_by = target_drop
-        async with CATCH_LOCK:
-            row2 = await db_get(conn, "SELECT caught_by FROM drops WHERE id=?", (drop_id,))
-            if row2 and row2[0] and row2[0] != 0:
-                await update.message.reply_text("Too late — someone already caught it.")
-                return
-            card = await db_get(conn, "SELECT name, rarity FROM cards WHERE id=?", (card_id,))
-            if not card:
-                await update.message.reply_text("Card not found.")
-                return
-            name, rarity = card
-            success_chance = max(0.2, 1.0 - rarity * 0.075)
-            if random.random() <= success_chance:
-                await conn.execute("UPDATE drops SET caught_by=? WHERE id=?", (user.id, drop_id))
-                await conn.commit()
-                reward = 10 + (9 - rarity) * 5 + rarity * 10
-                await change_balance(conn, user.id, reward, note=f"caught card {name}")
-                await update.message.reply_text(f"🎉 You caught *{name}*! Reward: {reward} coins.", parse_mode="Markdown")
-            else:
-                await update.message.reply_text("😢 Your attempt failed — someone else might still catch it.")
-    finally:
-        await conn.close()
-
-# --- Economy & shop ---
-async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = await aiosqlite.connect(DB_FILE)
-    try:
-        await ensure_user(conn, update.effective_user)
-        row = await db_get(conn, "SELECT balance FROM users WHERE id=?", (update.effective_user.id,))
-        bal = row[0] if row else 0
-        await update.message.reply_text(f"💰 Balance: {bal} coins")
-    finally:
-        await conn.close()
-
-async def daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = await aiosqlite.connect(DB_FILE)
-    try:
-        await ensure_user(conn, update.effective_user)
-        row = await db_get(conn, "SELECT last_daily, balance FROM users WHERE id=?", (update.effective_user.id,))
-        last_daily = row[0] if row else None
-        if last_daily:
-            dt = datetime.fromisoformat(last_daily)
-            if datetime.utcnow() - dt < timedelta(hours=20):
-                await update.message.reply_text("Daily already claimed. Try later.")
-                return
-        reward = random.randint(50, 150)
-        await conn.execute("UPDATE users SET balance=balance+?, last_daily=? WHERE id=?", (reward, datetime.utcnow().isoformat(), update.effective_user.id))
-        await conn.commit()
-        await update.message.reply_text(f"✅ Daily claimed: {reward} coins")
-    finally:
-        await conn.close()
-
-# --- Simple gambling games ---
-async def slots_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = await aiosqlite.connect(DB_FILE)
-    try:
-        await ensure_user(conn, update.effective_user)
-        if not context.args:
-            await update.message.reply_text("Usage: /slots <bet>")
-            return
-        bet = int(context.args[0])
-        row = await db_get(conn, "SELECT balance FROM users WHERE id=?", (update.effective_user.id,))
-        bal = row[0]
+        bal = get_balance(user.get("id"))
         if bet <= 0 or bet > bal:
-            await update.message.reply_text("Invalid bet.")
+            send_message(chat_id, "Invalid bet or insufficient balance.")
             return
         reels = [random.randint(0,4) for _ in range(3)]
         symbols = ["🍒","🍋","🔔","⭐","💎"]
         display = " ".join(symbols[r] for r in reels)
         if reels[0] == reels[1] == reels[2]:
             win = bet * 5
-            await change_balance(conn, update.effective_user.id, win, note="slots win")
-            result = f"JACKPOT! {display}\nYou won {win} coins!"
+            change_balance(user.get("id"), win)
+            send_message(chat_id, f"JACKPOT! {display}\nYou won {win} coins!")
         elif reels[0] == reels[1] or reels[1] == reels[2] or reels[0] == reels[2]:
             win = int(bet * 1.5)
-            await change_balance(conn, update.effective_user.id, win, note="slots small win")
-            result = f"{display}\nYou won {win} coins!"
+            change_balance(user.get("id"), win)
+            send_message(chat_id, f"{display}\nYou won {win} coins!")
         else:
-            await change_balance(conn, update.effective_user.id, -bet, note="slots lose")
-            result = f"{display}\nYou lost {bet} coins."
-        await update.message.reply_text(result)
-    finally:
-        await conn.close()
-
-async def wheel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = await aiosqlite.connect(DB_FILE)
-    try:
-        await ensure_user(conn, update.effective_user)
-        if not context.args:
-            await update.message.reply_text("Usage: /wheel <bet>")
-            return
-        bet = int(context.args[0])
-        row = await db_get(conn, "SELECT balance FROM users WHERE id=?", (update.effective_user.id,))
-        bal = row[0]
-        if bet <= 0 or bet > bal:
-            await update.message.reply_text("Invalid bet.")
-            return
-        multipliers = [0, 0.5, 1, 2, 5, 10]
-        mult = random.choice(multipliers)
-        if mult == 0:
-            await change_balance(conn, update.effective_user.id, -bet, note="wheel lose")
-            await update.message.reply_text(f"Wheel: {mult}x — you lost {bet} coins.")
-        else:
-            gain = int(bet * mult)
-            await change_balance(conn, update.effective_user.id, gain, note="wheel win")
-            await update.message.reply_text(f"Wheel: {mult}x — you won {gain} coins!")
-    finally:
-        await conn.close()
-
-# --- Trade / duel / marry simplified placeholders ---
-async def duel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Reply to a user with /duel to challenge them.")
-        return
-    challenger = update.effective_user
-    target = update.message.reply_to_message.from_user
-    if target.is_bot:
-        await update.message.reply_text("Cannot duel bots.")
-        return
-    winner = random.choice([challenger, target])
-    await update.message.reply_text(f"⚔️ Duel result: {winner.full_name} wins!")
-
-async def trade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Trade feature: reply to user with /trade <card_id> to propose trade (not fully implemented in this minimal version).")
-
-async def marry_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Reply to user with /marry to marry them.")
-        return
-    a = update.effective_user.id
-    b = update.message.reply_to_message.from_user.id
-    conn = await aiosqlite.connect(DB_FILE)
-    try:
-        await ensure_user(conn, update.effective_user)
-        await ensure_user(conn, update.message.reply_to_message.from_user)
-        await conn.execute("INSERT INTO marriages(user1, user2, at) VALUES (?,?,?)", (a,b,datetime.utcnow().isoformat()))
-        await conn.commit()
-        await update.message.reply_text("💍 Marriage recorded.")
-    finally:
-        await conn.close()
-
-async def divorce_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user.id
-    conn = await aiosqlite.connect(DB_FILE)
-    try:
-        await conn.execute("DELETE FROM marriages WHERE user1=? OR user2=?", (user,user))
-        await conn.commit()
-        await update.message.reply_text("⚖️ Divorce processed (if any).")
-    finally:
-        await conn.close()
-
-# --- Owner / sudo management ---
-async def addsudo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = await require_owner(update, context)
-    if not conn:
-        return
-    try:
-        if update.message.reply_to_message:
-            tid = update.message.reply_to_message.from_user.id
-        elif context.args:
-            try:
-                tid = int(context.args[0])
-            except:
-                await update.message.reply_text("Invalid id.")
+            change_balance(user.get("id"), -bet)
+            send_message(chat_id, f"{display}\nYou lost {bet} coins.")
+    elif cmd.lower() == "catch":
+        # try reply message id or name
+        name = " ".join(args).strip() if args else None
+        with DB_LOCK:
+            cur = DB.cursor()
+            if name:
+                cur.execute("SELECT id, name, caught_by FROM drops WHERE chat_id=? AND caught_by=0 AND lower(name)=? ORDER BY dropped_at DESC LIMIT 1", (chat_id, name.lower()))
+            else:
+                cur.execute("SELECT id, name, caught_by FROM drops WHERE chat_id=? AND caught_by=0 ORDER BY dropped_at DESC LIMIT 1", (chat_id,))
+            row = cur.fetchone()
+            if not row:
+                send_message(chat_id, "No available drop to catch here.")
                 return
-        else:
-            await update.message.reply_text("Usage: /addsudo <id> or reply.")
+            drop_id, cname, caught_by = row
+            # simple success chance
+            rarity_factor = 0  # minimal version: all same rarity
+            success_chance = 0.8
+            if random.random() <= success_chance:
+                cur.execute("UPDATE drops SET caught_by=? WHERE id=?", (user.get("id"), drop_id))
+                DB.commit()
+                reward = random.randint(10, 50)
+                change_balance(user.get("id"), reward)
+                send_message(chat_id, f"🎉 You caught *{cname}*! Reward: {reward} coins.", parse_mode="Markdown")
+            else:
+                send_message(chat_id, "😢 Your attempt failed — someone else might still catch it.")
+    elif cmd.lower() == "setdrop":
+        if not is_owner:
+            send_message(chat_id, "⛔ Owner-only command.")
             return
-        await conn.execute("INSERT OR REPLACE INTO sudo_users(id) VALUES (?)", (tid,))
-        await conn.commit()
-        await update.message.reply_text(f"✅ Added sudo: {tid}")
-    finally:
-        await conn.close()
+        if not args:
+            send_message(chat_id, "Usage: /setdrop <seconds>")
+            return
+        try:
+            sec = int(args[0])
+            set_setting("drop_interval", sec)
+            send_message(chat_id, f"✅ Drop interval set to {sec} seconds.")
+        except:
+            send_message(chat_id, "Invalid number.")
+    elif cmd.lower() == "adddropchat":
+        if not is_owner:
+            send_message(chat_id, "⛔ Owner-only command.")
+            return
+        if not args:
+            send_message(chat_id, "Usage: /adddropchat <chat_id>")
+            return
+        try:
+            cid = int(args[0])
+            raw = get_setting("drop_chats") or ""
+            lst = [x for x in raw.split(",") if x.strip()]
+            if str(cid) not in lst:
+                lst.append(str(cid))
+            set_setting("drop_chats", ",".join(lst))
+            send_message(chat_id, f"✅ Added drop chat: {cid}")
+        except:
+            send_message(chat_id, "Invalid chat id.")
+    else:
+        # ignore other commands or send help
+        if text.startswith("/"):
+            send_message(chat_id, "Unknown command. Use /help to see available commands.")
 
-async def sudolist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = await require_owner(update, context)
-    if not conn:
-        return
-    try:
-        rows = await db_all(conn, "SELECT id FROM sudo_users")
-        if not rows:
-            await update.message.reply_text("No sudo users.")
-            return
-        txt = "Sudo users:\n" + "\n".join(str(r[0]) for r in rows)
-        await update.message.reply_text(txt)
-    finally:
-        await conn.close()
-
-async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = await require_owner(update, context)
-    if not conn:
-        return
-    try:
-        if not context.args:
-            await update.message.reply_text("Usage: /broadcast <message>")
-            return
-        msg = " ".join(context.args)
-        rows = await db_all(conn, "SELECT id FROM users")
-        count = 0
-        for r in rows:
-            uid = r[0]
+def poll_loop():
+    global OFFSET
+    OFFSET = None
+    while True:
+        params = {}
+        if OFFSET:
+            params["offset"] = OFFSET
+        params["timeout"] = 30
+        resp = api_call("getUpdates", params)
+        if not resp.get("ok"):
+            print("getUpdates error:", resp)
+            time.sleep(5)
+            continue
+        for u in resp.get("result", []):
             try:
-                await context.bot.send_message(chat_id=uid, text=msg)
-                count += 1
-            except Exception:
-                pass
-        await update.message.reply_text(f"Broadcast sent to {count} users.")
-    finally:
-        await conn.close()
+                handle_update(u)
+            except Exception as e:
+                print("handle_update error:", e)
+        # small sleep to avoid tight loop
+        time.sleep(0.5)
 
-# --- Misc handlers / fallback ---
-async def unknown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Unknown command. Use /help to see available commands.")
-
-# --- Main entrypoint ---
-def main():
-    # initialize DB and start bot
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(init_db())
-
-    app = ApplicationBuilder().token(TOKEN).build()
-
-    # Register handlers
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("upload", upload_cmd))
-    app.add_handler(CommandHandler("uploadvd", uploadvd_cmd))
-    app.add_handler(CommandHandler("edit", edit_cmd))
-    app.add_handler(CommandHandler("delete", delete_cmd))
-    app.add_handler(CommandHandler("gban", gban_cmd))
-    app.add_handler(CommandHandler("ungban", ungban_cmd))
-    app.add_handler(CommandHandler("gmute", gmute_cmd))
-    app.add_handler(CommandHandler("ungmute", ungmute_cmd))
-    app.add_handler(CommandHandler("setdrop", setdrop_cmd))
-    app.add_handler(CommandHandler("Catch", catch_cmd))
-    app.add_handler(CommandHandler("balance", balance_cmd))
-    app.add_handler(CommandHandler("daily", daily_cmd))
-    app.add_handler(CommandHandler("slots", slots_cmd))
-    app.add_handler(CommandHandler("wheel", wheel_cmd))
-    app.add_handler(CommandHandler("duel", duel_cmd))
-    app.add_handler(CommandHandler("trade", trade_cmd))
-    app.add_handler(CommandHandler("marry", marry_cmd))
-    app.add_handler(CommandHandler("divorce", divorce_cmd))
-    app.add_handler(CommandHandler("addsudo", addsudo_cmd))
-    app.add_handler(CommandHandler("sudolist", sudolist_cmd))
-    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
-    app.add_handler(CommandHandler("setdrop", setdrop_cmd))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("unknown", unknown_cmd))
-    app.add_handler(MessageHandler(filters.COMMAND, unknown_cmd))
-
-    # Start background drop loop task
-    # create_task is safe here; run_polling will run the loop
-    loop.create_task(drop_loop(app))
-
-    print("Bot starting...")
-    app.run_polling()
-
+# --- Start threads ---
 if __name__ == "__main__":
-    main()
+    # start drop loop thread
+    t = threading.Thread(target=drop_loop, daemon=True)
+    t.start()
+    print("Bot started (polling). Press Ctrl+C to stop.")
+    try:
+        poll_loop()
+    except KeyboardInterrupt:
+        print("Stopping bot...")
+        sys.exit(0)
